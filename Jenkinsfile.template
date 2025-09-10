@@ -1,0 +1,461 @@
+// ============================================================================
+// JENKINSFILE TEMPLATE COMPLET - COPY/PASTE READY
+// Copier ce fichier et adapter selon tes besoins
+// ============================================================================
+
+pipeline {
+    agent any
+    
+    parameters {
+        string(name: 'APP_VERSION', defaultValue: 'latest', description: 'Version à déployer')
+        choice(name: 'ACTION', choices: ['deploy', 'infrastructure-only', 'app-only', 'rollback'], description: 'Action à effectuer')
+        string(name: 'ROLLBACK_VERSION', defaultValue: '', description: 'Version pour rollback')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Ignorer les tests')
+        booleanParam(name: 'FORCE_APPROVAL', defaultValue: false, description: 'Forcer l\'approbation même en DEV/STG')
+    }
+    
+    environment {
+        // Variables globales
+        SLACK_WEBHOOK = credentials('slack-webhook') // Optionnel
+    }
+    
+    stages {
+        stage('🔍 Auto-Detection Environment') {
+            steps {
+                script {
+                    env.TARGET_ENV = getEnvironment()
+                    env.CONFIG = getEnvConfig(env.TARGET_ENV).toString()
+                    
+                    echo """
+🎯 INFORMATIONS DE DÉPLOIEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• Environnement: ${env.TARGET_ENV}
+• Action: ${params.ACTION}
+• Version: ${params.APP_VERSION}
+• Job URL: ${env.JOB_URL}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    """
+                }
+            }
+        }
+        
+        stage('🔒 Conditional Approval') {
+            when {
+                anyOf {
+                    environment name: 'TARGET_ENV', value: 'PRD'
+                    params.FORCE_APPROVAL == true
+                }
+            }
+            steps {
+                script {
+                    askApprovalIfNeeded(env.TARGET_ENV, "Confirmer ${params.ACTION} de ${params.APP_VERSION} sur ${env.TARGET_ENV} ?")
+                }
+            }
+        }
+        
+        stage('🏗️ Infrastructure Deployment') {
+            when {
+                params.ACTION in ['deploy', 'infrastructure-only']
+            }
+            steps {
+                script {
+                    deployTerraform(env.TARGET_ENV)
+                    generateAnsibleInventory(env.TARGET_ENV)
+                    
+                    // Sauvegarder l'inventaire pour réutilisation
+                    stashInventory(env.TARGET_ENV)
+                }
+            }
+        }
+        
+        stage('🚀 Application Deployment') {
+            when {
+                params.ACTION in ['deploy', 'app-only']
+            }
+            steps {
+                script {
+                    // Récupérer l'inventaire si besoin
+                    if (params.ACTION == 'app-only') {
+                        try {
+                            unstashInventory(env.TARGET_ENV)
+                        } catch (Exception e) {
+                            echo "⚠️ Pas d'inventaire en stash, génération..."
+                            generateAnsibleInventory(env.TARGET_ENV)
+                        }
+                    }
+                    
+                    deployApplication(env.TARGET_ENV, params.APP_VERSION)
+                }
+            }
+        }
+        
+        stage('🔄 Rollback') {
+            when {
+                params.ACTION == 'rollback'
+            }
+            steps {
+                script {
+                    if (!params.ROLLBACK_VERSION) {
+                        error "❌ Version de rollback requise"
+                    }
+                    rollback(env.TARGET_ENV, params.ROLLBACK_VERSION)
+                }
+            }
+        }
+        
+        stage('🏥 Health Checks') {
+            when {
+                allOf {
+                    params.ACTION in ['deploy', 'app-only', 'rollback']
+                    not { params.SKIP_TESTS }
+                }
+            }
+            steps {
+                script {
+                    if (!runHealthChecks(env.TARGET_ENV)) {
+                        error "❌ Health checks échoués"
+                    }
+                }
+            }
+        }
+        
+        stage('📊 Post-Deploy Info') {
+            when {
+                params.ACTION in ['deploy', 'app-only']
+            }
+            steps {
+                script {
+                    // Afficher les URLs utiles
+                    try {
+                        dir('terraform') {
+                            def outputs = sh(script: 'terraform output -json', returnStdout: true).trim()
+                            def parsed = readJSON text: outputs
+                            
+                            if (parsed.load_balancer_dns?.value) {
+                                echo "🌐 Application URL: http://${parsed.load_balancer_dns.value}"
+                                env.APP_URL = "http://${parsed.load_balancer_dns.value}"
+                            }
+                        }
+                    } catch (Exception e) {
+                        echo "⚠️ Impossible de récupérer l'URL: ${e.message}"
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                // Archiver les artefacts importants
+                archiveArtifacts artifacts: '''
+                    terraform/tfplan,
+                    ansible/inventories/**/*.ini
+                ''', allowEmptyArchive: true
+                
+                // Publier l'inventaire comme rapport
+                if (fileExists("ansible/inventories/${env.TARGET_ENV}/hosts.ini")) {
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: "ansible/inventories/${env.TARGET_ENV}",
+                        reportFiles: 'hosts.ini',
+                        reportName: 'Ansible Inventory'
+                    ])
+                }
+            }
+        }
+        
+        success {
+            script {
+                def message = "Déploiement ${params.APP_VERSION} réussi"
+                if (env.APP_URL) {
+                    message += " - ${env.APP_URL}"
+                }
+                notifySlack(env.TARGET_ENV, "SUCCESS", message)
+                
+                echo "🎉 Déploiement terminé avec succès !"
+            }
+        }
+        
+        failure {
+            script {
+                notifySlack(env.TARGET_ENV, "FAILURE", "Échec du déploiement ${params.APP_VERSION}")
+                
+                // Proposer un rollback automatique en PRD
+                if (env.TARGET_ENV == 'PRD' && params.ACTION in ['deploy', 'app-only']) {
+                    echo """
+💥 ÉCHEC EN PRODUCTION !
+
+🔄 Pour effectuer un rollback:
+1. Relancer cette pipeline
+2. Choisir ACTION = 'rollback'  
+3. Spécifier ROLLBACK_VERSION
+
+📞 Contacter l'équipe ops si nécessaire.
+                    """
+                }
+            }
+        }
+        
+        cleanup {
+            script {
+                // Nettoyage optionnel
+                echo "🧹 Nettoyage terminé"
+            }
+        }
+    }
+}
+
+// ============================================================================
+// FONCTIONS UTILITAIRES - COPIER CES FONCTIONS DANS TON JENKINSFILE
+// ============================================================================
+
+/**
+ * Détecte l'environnement basé sur l'URL Jenkins
+ */
+def getEnvironment() {
+    def jobUrl = env.JOB_URL ?: env.BUILD_URL ?: ""
+    echo "🔍 URL analysée: ${jobUrl}"
+    
+    if (jobUrl.contains("job/DEV/job") || jobUrl.contains("/job/DEV/")) {
+        echo "✅ Environnement détecté: DEV"
+        return "DEV"
+    }
+    if (jobUrl.contains("job/STG/job") || jobUrl.contains("/job/STG/")) {
+        echo "✅ Environnement détecté: STG"
+        return "STG"
+    }
+    if (jobUrl.contains("job/PRD/job") || jobUrl.contains("/job/PRD/")) {
+        echo "✅ Environnement détecté: PRD"
+        return "PRD"
+    }
+    
+    echo "⚠️ Environnement non détecté, utilisation de DEV par défaut"
+    return "DEV"
+}
+
+/**
+ * Configuration par environnement
+ */
+def getEnvConfig(String env) {
+    def configs = [
+        "DEV": [
+            instanceType: "t3.micro",
+            instanceCount: 1,
+            needsApproval: false,
+            slackChannel: "#dev-team"
+        ],
+        "STG": [
+            instanceType: "t3.small",
+            instanceCount: 2,
+            needsApproval: false,
+            slackChannel: "#staging-team"
+        ],
+        "PRD": [
+            instanceType: "t3.medium",
+            instanceCount: 3,
+            needsApproval: true,
+            slackChannel: "#prod-alerts"
+        ]
+    ]
+    
+    def config = configs[env] ?: configs["DEV"]
+    echo "⚙️ Config ${env}: ${config}"
+    return config
+}
+
+/**
+ * Approbation conditionnelle
+ */
+def askApprovalIfNeeded(String env, String message = null) {
+    def config = getEnvConfig(env)
+    message = message ?: "Continuer le déploiement sur ${env} ?"
+    
+    if (config.needsApproval) {
+        echo "🔒 Approbation requise pour ${env}"
+        timeout(time: 30, unit: 'MINUTES') {
+            input message: message,
+                  ok: "Approuver ${env}",
+                  submitterParameter: 'APPROVER'
+        }
+        echo "✅ Approuvé par ${env.APPROVER ?: 'inconnu'}"
+    } else {
+        echo "⏭️ Pas d'approbation requise pour ${env}"
+    }
+}
+
+/**
+ * Déploie avec Terraform
+ */
+def deployTerraform(String env) {
+    echo "🏗️ Déploiement Terraform pour ${env}"
+    
+    def config = getEnvConfig(env)
+    
+    dir('terraform') {
+        sh """
+            terraform init
+            terraform plan -var-file="environments/${env}.tfvars" \
+                          -var="instance_type=${config.instanceType}" \
+                          -var="instance_count=${config.instanceCount}" \
+                          -out=tfplan
+            terraform apply -auto-approve tfplan
+        """
+    }
+    echo "✅ Terraform ${env} déployé"
+}
+
+/**
+ * Génère un inventaire Ansible
+ */
+def generateAnsibleInventory(String env) {
+    echo "📋 Génération inventaire Ansible pour ${env}"
+    
+    def inventoryDir = "ansible/inventories/${env}"
+    sh "mkdir -p ${inventoryDir}"
+    
+    def outputs = [:]
+    try {
+        dir('terraform') {
+            def tfOutput = sh(script: 'terraform output -json', returnStdout: true).trim()
+            outputs = readJSON text: tfOutput
+        }
+    } catch (Exception e) {
+        echo "⚠️ Impossible de récupérer les outputs Terraform: ${e.message}"
+        return false
+    }
+    
+    def inventory = "# Inventaire ${env} - ${new Date()}\n\n"
+    
+    inventory += "[webservers]\n"
+    if (outputs.web_servers?.value) {
+        outputs.web_servers.value.each { server ->
+            inventory += "${server.name} ansible_host=${server.public_ip} ansible_user=ubuntu\n"
+        }
+    }
+    
+    inventory += "\n[databases]\n"
+    if (outputs.db_servers?.value) {
+        outputs.db_servers.value.each { server ->
+            inventory += "${server.name} ansible_host=${server.private_ip} ansible_user=ubuntu\n"
+        }
+    }
+    
+    inventory += "\n[all:vars]\n"
+    inventory += "environment=${env}\n"
+    
+    writeFile file: "${inventoryDir}/hosts.ini", text: inventory
+    echo "✅ Inventaire créé: ${inventoryDir}/hosts.ini"
+    sh "cat ${inventoryDir}/hosts.ini"
+    return true
+}
+
+/**
+ * Déploie l'application
+ */
+def deployApplication(String env, String version = "latest") {
+    echo "🚀 Déploiement application ${version} sur ${env}"
+    
+    def inventoryPath = "ansible/inventories/${env}/hosts.ini"
+    
+    if (!fileExists(inventoryPath)) {
+        echo "📋 Inventaire manquant, génération..."
+        if (!generateAnsibleInventory(env)) {
+            error "❌ Impossible de générer l'inventaire"
+        }
+    }
+    
+    dir('ansible') {
+        sh "ansible all -i ${inventoryPath} -m ping --timeout=10"
+        sh """
+            ansible-playbook -i ${inventoryPath} \
+                            -e environment=${env} \
+                            -e app_version=${version} \
+                            playbooks/deploy.yml
+        """
+    }
+    
+    echo "✅ Application ${version} déployée sur ${env}"
+}
+
+/**
+ * Tests de santé
+ */
+def runHealthChecks(String env) {
+    echo "🏥 Tests de santé pour ${env}"
+    
+    try {
+        dir('ansible') {
+            sh """
+                ansible webservers -i inventories/${env}/hosts.ini \
+                        -m uri -a "url=http://{{ ansible_host }}/health method=GET"
+            """
+        }
+        echo "✅ Tests de santé OK"
+        return true
+    } catch (Exception e) {
+        echo "❌ Tests de santé échoués: ${e.message}"
+        return false
+    }
+}
+
+/**
+ * Notification Slack
+ */
+def notifySlack(String env, String status, String message) {
+    if (!env.SLACK_WEBHOOK) {
+        echo "📢 ${status}: ${message}"
+        return
+    }
+    
+    def config = getEnvConfig(env)
+    def emoji = status == "SUCCESS" ? "✅" : "❌"
+    def payload = [
+        channel: config.slackChannel,
+        text: "${emoji} [${env}] ${message}",
+        username: "Jenkins"
+    ]
+    
+    try {
+        sh """
+            curl -X POST '${env.SLACK_WEBHOOK}' \
+                 -H 'Content-Type: application/json' \
+                 -d '${groovy.json.JsonOutput.toJson(payload)}'
+        """
+        echo "📱 Notification Slack envoyée"
+    } catch (Exception e) {
+        echo "⚠️ Erreur notification Slack: ${e.message}"
+    }
+}
+
+/**
+ * Rollback
+ */
+def rollback(String env, String previousVersion) {
+    echo "🔄 Rollback vers ${previousVersion} sur ${env}"
+    askApprovalIfNeeded(env, "Confirmer le rollback vers ${previousVersion} ?")
+    deployApplication(env, previousVersion)
+    
+    if (runHealthChecks(env)) {
+        notifySlack(env, "SUCCESS", "Rollback vers ${previousVersion} réussi")
+    } else {
+        notifySlack(env, "FAILURE", "Rollback vers ${previousVersion} échoué")
+        error "❌ Rollback échoué"
+    }
+}
+
+/**
+ * Stash/Unstash inventaire
+ */
+def stashInventory(String env) {
+    stash includes: "ansible/inventories/${env}/**", name: "inventory-${env}-${env.BUILD_NUMBER}"
+    echo "📦 Inventaire ${env} sauvegardé"
+}
+
+def unstashInventory(String env, String buildNumber = null) {
+    buildNumber = buildNumber ?: env.BUILD_NUMBER
+    unstash "inventory-${env}-${buildNumber}"
+    echo "📦 Inventaire ${env} récupéré"
+}
