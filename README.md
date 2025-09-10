@@ -204,14 +204,3 @@ script {
     echo "- Detected ENV: ${getEnvironment()}"
 }
 ```
-
-## 📞 Contact
-
-Pour toute question ou amélioration :
-- 📧 Email : votre.email@company.com
-- 💬 Slack : #devops-support
-- 📋 Issues : GitHub Issues
-
----
-
-> 💡 **Astuce** : Commencez par tester en DEV, puis STG, puis PRD !
